@@ -20,7 +20,7 @@ submitted to *Biometrics*.
 ## Instructions
 
 To reproduce the results:
-1. Load the required packages listed in the beginning of each script.
+1. Install and load the required packages listed in the beginning of `Simulation.R`.
 2. Run `Simulation.R` to generate simulation results.
 
 For questions, please contact yhkwon@kma.ac.kr.
