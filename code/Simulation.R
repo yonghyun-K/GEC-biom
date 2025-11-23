@@ -6,7 +6,7 @@
 if (!interactive()) {
   args <- as.numeric(commandArgs(trailingOnly = TRUE))
 } else{
-  args <- c(500)
+  args <- c(5)
 }
 
 timenow1 = Sys.time()
@@ -18,38 +18,64 @@ timenow = paste(timenow0, ".txt", sep = "")
 library(nleqslv)
 library(PracTools)
 suppressMessages(library(foreach))
-suppressMessages(library(doParallel))
+suppressMessages(library(doRNG))
 # library(caret)
 library(tidyverse)
 library(xtable)
 library(GECal)
 # library(mice)
 # library(kableExtra)
+library(ranger)
+
+load("../data/nhis.Rdata")
 
 set.seed(11)
 SIMNUM = args[1]
 
 if (!interactive()) {
+  suppressMessages(library(doMC))
   dir.create(timenow0)
   setwd(timenow0)
   
   sink(timenow, append = TRUE)
+  
+  ## doMC backend registration
+  nc <- parallel::detectCores(logical = TRUE)
+  reserve <- 2L
+  target <- max(1L, nc - reserve)
+  want_workers <- 500L
+  workers <- max(1L, min(want_workers, SIMNUM))
+  
+  Sys.setenv(OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1")
+  registerDoMC(workers)
+  message(sprintf("doMC backend: detectCores=%d, using workers=%d", nc, getDoParWorkers()))
+  
+  # (Optional) Somke test
+  .ok <- tryCatch({
+    aa <- foreach(i = 1:getDoParWorkers(), .combine=c) %dopar% i
+    length(aa) == getDoParWorkers()
+  }, error=function(e){ message("Smoke test failed: ", conditionMessage(e)); FALSE })
+  if (!.ok) stop("doMC Smoke test failed")
+}else{
+  suppressMessages(library(doParallel))
+  
+  # ## setup parallel backend to use many processors
+  print(paste("detectCores =", detectCores()))
+  cores = min(detectCores() - 3, 120)
+  # cores = 2
+  print(paste("cores =", cores))
+  # cl <- makeCluster(cores, outfile = timenow) #not to overload your computer
+  cl <- makeCluster(cores)
+  registerDoParallel(cl)
 }
-# setup parallel backend to use many processors
-cores = min(detectCores() - 3, 101)
-print(paste("cores =", cores))
-# cl <- makeCluster(cores, outfile = timenow) #not to overload your computer
-cl <- makeCluster(cores)
-registerDoParallel(cl)
-# summary(smho98)
-# summary(smho.N874)
-
-load("../data/nhis.Rdata")
 
 N <- nrow(nhis)
 
 tab1 = table(nhis$AgeGroup, nhis$REGION1, nhis$SEX)
-tab1 = ifelse(tab1 > 15, 5, round(tab1 / 3))
+
+nh_min = 5
+tab1 = ifelse(tab1 > 3 * nh_min, nh_min, round(tab1 / 3))
+# tab1 = ifelse(tab1 > 3 * nh_min, nh_min, tab1)
 
 n = sum(tab1)
 
@@ -57,15 +83,17 @@ nhis$Smoking <- ifelse(nhis$Smoking == 3, 1, 0)
 
 # summary(nhis)
 
-nhis$Hemo <- nhis$OralExam  # Variable of interest y is Smoking
+print("y is Hemo")
+# nhis$Hemo <- nhis$OralExam; print("y is OralExam")  # Variable of interest y is Smoking
 
 theta = mean(nhis$Hemo)
+print(paste("theta =", theta))
 
 final_res <- foreach(
   simnum = 1:SIMNUM,
-  .packages = c("nleqslv", "PracTools", "GECal"),
+  .packages = c("nleqslv", "PracTools", "GECal", "ranger"),
   .errorhandling = "pass"
-) %dopar% {
+) %dorng% {
   
   index = c()
   pi_S = c()
@@ -218,6 +246,71 @@ final_res <- foreach(
   # eta[index] = eta[index] + (y_S - yhat[index] - drop(hhat %*% kappa)[index]) / pihat[index]
   # 
   # se_res = c(se_res, AIPW = sqrt(var(eta) / N))
+  
+  
+  x_R <- c("AgeGroup", "REGION1", "SEX")
+  x_Y <- c("AgeGroup", "SEX", "HT", "WT", "Waist", "Alcohol",
+           "SysBP", "DiaBP", "FBS", "Creatinine")
+  
+  K       <- 5  # fewer folds = faster
+  fold_id <- sample(rep(1:K, length.out = N))
+  folds   <- split(seq_len(N), fold_id)
+  
+  cf_tbl <- do.call(
+    rbind,
+    lapply(folds, function(test) {
+      train <- setdiff(seq_len(N), test)
+      
+      ## 1) RF for P(delta = 1 | X_R)
+      train_R <- nhis[train, x_R, drop = FALSE]
+      train_R$delta <- factor(delta[train], levels = c(0, 1))
+      
+      rf_R <- ranger(
+        delta ~ .,
+        data        = train_R,
+        probability = TRUE,
+        num.trees   = 200,      # lower than 500
+        importance  = "none",
+        keep.inbag  = FALSE
+      )
+      
+      test_R  <- nhis[test, x_R, drop = FALSE]
+      prob_RF <- predict(rf_R, data = test_R)$predictions
+      p_hat   <- prob_RF[, "1"]
+      
+      ## 2) RF for E[Hemo | X_Y] using only observed Y
+      obs_train <- train[delta[train] == 1]
+      train_Y   <- nhis[obs_train, c("Hemo", x_Y)]
+      
+      rf_Y <- ranger(
+        Hemo ~ .,
+        data      = train_Y,
+        num.trees = 200,
+        importance = "none",
+        keep.inbag = FALSE
+      )
+      
+      y_hat <- predict(rf_Y, data = nhis[test, x_Y, drop = FALSE])$predictions
+      
+      data.frame(i = test, pihat_DML = p_hat, yhat_DML = y_hat)
+    })
+  )
+  
+  pihat_DML <- numeric(N); pihat_DML[cf_tbl$i] <- cf_tbl$pihat_DML
+  yhat_DML  <- numeric(N); yhat_DML[cf_tbl$i]  <- cf_tbl$yhat_DML
+  
+  if(pimethod == 0){
+    pihat_DML = pi
+  }else if(pimethod == 1){
+    pihat_DML = rep(n / N, N)
+  }
+  
+  AIPW_mean_Hemo_RF <- mean(yhat_DML) + sum((y_S - yhat_DML[index]) / pihat_DML[index]) / sum(1 / pihat_DML[index])
+  AIPW_mean_Hemo_RF
+  
+  ## --- AIPW / DML estimator of the population mean ---
+  eta <- yhat_DML + delta * (nhis$Hemo - yhat_DML) / pihat_DML
+  AIPW_var_Hemo_RF = sqrt(var(eta) / sum(1 / pihat_DML[index]))
 
   vectmp <- as.character(formula(Omodel))[3]
   # vectmp <- c("Y_IP")
@@ -283,6 +376,8 @@ final_res <- foreach(
     theta_res = c(theta_res, setNames(res_est[1] / N, paste("GEC", entropy, sep = "_"))) # DS
     se_res = c(se_res, setNames(res_est[2] / N, paste("GEC", entropy, sep = "_")))
   }
+  theta_res = c(theta_res, DML = AIPW_mean_Hemo_RF) # AIPW  
+  se_res = c(se_res, DML = AIPW_var_Hemo_RF)
   }
   
   CR_res = ifelse(abs(theta_res - theta) < qnorm(0.975) * se_res, 1, 0)
@@ -299,7 +394,7 @@ if(!interactive()) save.image(paste(timenow0, ".RData", sep = ""))
 
 final_res1 = lapply(final_res, function(x) x[[1]])
 
-stopCluster(cl)
+# stopCluster(cl)
 timenow2 = Sys.time()
 print(timenow2 - timenow1)
 # if(sum(!sapply(final_res1, function(x) is.numeric(unlist(x)))) != 0) stop(paste(final_res1))
