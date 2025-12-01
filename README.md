@@ -9,6 +9,7 @@ submitted to *Biometrics*.
 - **code/**
   - `Simulation.R`: Code for running the simulation study.
   - `RealData.R`: Code for analyzing the real data example. The real dataset is not publicly available due to confidentiality restrictions.
+  - `Simulation_extra.R`: Code for running the additional simulation in the supplementary material.  
   - `Archive/`: Additional scripts and legacy code.
 
 - **data/**
