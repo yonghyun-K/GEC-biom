@@ -13,7 +13,7 @@ submitted to *Biometrics*.
   - `Archive/`: Additional scripts and legacy code.
 
 - **data/**
-  - `nhis.Rdata`: Required dataset for running `Simulation.R`.
+  - `nhis.Rdata`: Required dataset for running `Simulation.R`. A subsample of 100,000 observations from 2021 NHIS data. (https://www.data.go.kr/en/data/15007122/fileData.do#)
 
 - **output/**
   - `CI.png`: Output figure showing confidence intervals from the real data analysis.
